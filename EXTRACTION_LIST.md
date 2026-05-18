@@ -20,8 +20,9 @@ Each entry follows the same shape:
 - **Why it matters.** Robust to signal failure without per-modality calibration, dodges the "vector returns 0.001 but BM25 returns 12.4" normalization problem.
 
 ### A2. Triple-stream candidate retrieval with graph expansion from top-N vector hits  [M]
-- **Idea.** Run BM25, vector, and graph entity search in parallel. Then take the **top-5 vector hits** and use them as seed nodes to expand the graph one hop further, *adding* those hops to the graph result set. The graph signal gets two sources: direct entity hits from query NER + neighbors of strong vector hits.
+- **Idea.** Run BM25, vector, and graph entity search in parallel. Then take the **top-5 vector hits** and use them as seed nodes to expand the graph one hop further (`expandFromChunks(seeds, hops=1, fanout=5)`), *appending* those hops to the graph result set. The graph signal gets two sources: direct entity hits from query NER + neighbors of strong vector hits.
 - **Where.** `src/state/hybrid-search.ts` `tripleStreamSearch`.
+- **Dedup policy.** When the same `obsId` shows up in *both* graph sources, **min the rank and max the score** within the graph slot (NOT sum). Across the three signals (BM25 / vector / graph), each contributes its own independent rank into the RRF in A1 — never summed across signals either.
 - **Re-impl.** Don't bother unless we have a graph. If we do: keep expansion conservative (1 hop, ≤5 neighbors) so it can't dominate.
 - **Risk.** Hops compound — guardrails on both fan-out and recursion.
 
@@ -61,22 +62,26 @@ Each entry follows the same shape:
 - **Where.** `reranker.ts`.
 
 ### A10. Per-key promise-chain mutex (keyed serialization)  [H]
-- **Idea.** Trivially small primitive (~15 LOC) that serializes async operations per key without locks or queues. Pattern: `next = (locks.get(key) ?? Promise.resolve()).then(fn, fn)` (the duplicate `fn` handler runs the function *whether or not* the previous one rejected, preserving FIFO order across failures). Cleanup self-deletes the map entry only if no newer chain replaced it. Used to serialize index updates by observation ID.
+- **Idea.** Trivially small primitive (~15 LOC) that serializes async operations per key without locks or queues. Three subtle parts:
+  1. **Chain head:** `next = (locks.get(key) ?? Promise.resolve()).then(fn, fn)`. The duplicate `fn` (used as both fulfill *and* reject handler) means `fn` runs whether the previous link resolved or rejected — without it, a single failed op would block all subsequent ops for that key forever.
+  2. **Cleanup tail:** a separate `cleanup = next.then(noop, noop)` that swallows rejections — so the value stored in the map can be safely awaited by the next caller without becoming `unhandledRejection`. The map stores `cleanup`, not `next`.
+  3. **Compare-and-delete:** `if (locks.get(key) === cleanup) locks.delete(key)`. Only delete if a newer chain hasn't already replaced ours — without this guard, a fast follow-up call would have its chain dropped from the map and run unserialized.
 - **Where.** `src/state/keyed-mutex.ts`.
-- **Re-impl.** This is one of the highest leverage utilities to copy as an *idea*. We probably want our version to optionally include error logging in the catch-side; their version is silent.
+- **Re-impl.** Highest-leverage utility to copy as an *idea*. We probably want our version to optionally include error logging in the catch-side; theirs is silent.
 
 ---
 
 ## B. Memory operations
 
 ### B1. Retention scoring: salience × exp(-λΔt) + Σ σ/days_since_access  [H]
-- **Idea.** Three-component retention score, all bounded to [0,1]:
-  - **Salience** — type-weighted base (architecture=0.9, bug=0.7, pattern=0.8, preference=0.85, fact=0.5) + small access-count bonus (capped at +0.2).
+- **Idea.** Three-component retention score, combined as `min(1, salience × temporalDecay + reinforcementBoost)`:
+  - **Salience** — start from 0.5 base, look up type-weighted override: `architecture=0.9, preference=0.85, pattern=0.8, bug=0.7, workflow=0.6, fact=0.5` (unknown types fall back to 0.5). Add access-count bonus: `min(0.2, accessCount × 0.02)`. For semantic memories with a `confidence` field, take `max(baseSalience, confidence)` before adding the bonus. Final salience clamped to ≤ 1.
   - **Temporal decay** — Ebbinghaus-style: `exp(-λ × days_since_created)`.
-  - **Reinforcement boost** — `σ × Σ (1 / days_since_each_access)`. Recent accesses pump the score back up, old ones contribute almost nothing.
+  - **Reinforcement boost** — `σ × Σ (1 / days_since_each_access)` summed over a bounded recency window (see B15, capped at 20 entries). Recent accesses pump the score back up; an access 1 day ago contributes σ × 1.0, a 10-day-old access contributes σ × 0.1. Skip access timestamps where `daysSinceAccess <= 0` (don't divide by zero on near-now accesses).
+- **Defaults.** `λ = 0.01`, `σ = 0.3`. Tier thresholds `hot = 0.7, warm = 0.4, cold = 0.15`. Anything below `cold` is "evictable/frozen".
+- **Config validation.** Reject λ ≤ 0 or non-finite; reject σ < 0 or non-finite; require `hot ≥ warm ≥ cold ≥ 0`. Surface the violation as a clear error string at config parse time, not at score time.
 - **Where.** `src/functions/retention.ts`.
-- **Re-impl.** Clean formula, plug-in λ and σ. The split into base/decay/reinforcement is the part worth keeping — many memory systems collapse to a single counter, which can't be tuned.
-- **Tier mapping.** Score → {hot ≥ 0.7, warm ≥ 0.4, cold ≥ 0.15, frozen <0.15}. Useful for cheap eviction priority. Validate `hot ≥ warm ≥ cold ≥ 0` at config parse time.
+- **Re-impl.** The split into base/decay/reinforcement is the part worth keeping — many memory systems collapse to a single counter, which can't be tuned.
 
 ### B1b. Tier-specific decay rates `strength *= 0.9^(daysSince/decayDays_per_tier)`  [M]
 - **Idea.** Different memory tiers (episodic / semantic / procedural) consolidate and decay at different speeds; encode that as **a per-tier `decayDays` parameter** plugged into the same exponential. Semantic memory weighs confidence too. Procedurals are only minted from patterns observed ≥2 times.
@@ -84,13 +89,18 @@ Each entry follows the same shape:
 - **Re-impl.** A 5-line `decayMultiplier(tier, daysSince)` lookup with a small config map. Far more expressive than one global λ.
 
 ### B2. Auto-forget pipeline (TTL + Jaccard contradiction + low-value sweep)  [H]
-- **Idea.** Periodic background sweep does three independent forgets:
-  1. **TTL expiry** — anything with `forgetAfter` past now → delete.
-  2. **Contradiction detection** — Jaccard similarity over content tokens; pairs above 0.9 mark the *older* one as `isLatest=false` (don't hard-delete). To avoid O(n²), bucket memories by shared concept tags and only compare within buckets (`conceptIndex`).
-  3. **Low-value observations** — age > 180 days AND importance ≤ 2 → delete.
+- **Idea.** Periodic background sweep does three independent forgets, in order:
+  1. **TTL expiry** — anything with `forgetAfter` past now → hard delete. Decrement any imageRef before deleting. Track deleted ids in a `Set` so step 2 doesn't redo them.
+  2. **Contradiction detection** — Jaccard over content tokens; pairs **strictly above** 0.9 (`sim > 0.9`, not ≥) mark the *older* of the pair as `isLatest=false` (soft delete only — don't hard-delete contradictions). Important details:
+     - Restrict to `isLatest !== false` memories, take top 1000 by recency to bound work.
+     - Token set = `lowercase(content).split(/\s+/)` filtered to tokens with length > 2.
+     - Bucket memories by **concept tag** (lowercased) via a `conceptIndex: Map<concept, memId[]>`. Compare only pairs within a shared concept bucket.
+     - Use a `compared: Set<string>` of canonical-ordered keys `"${minId}|${maxId}"` to skip pairs that share *two* concepts (otherwise they'd be compared twice). This is the crucial guard — without it, the inner loop revisits the same pair through every shared concept and your O(n × b) becomes O(n × b × c).
+     - Pair similarity: `intersection / (|A| + |B| - intersection)`. Skip when either set is empty.
+  3. **Low-value observations** — for each session, walk its observations; if `age > 180 days AND (importance ?? 5) <= 2`, hard-delete. Iterate sessions in chunks of 10 in parallel. On delete, decrement `imageData`/`imageRef` refs (avoid double-decrement when they're equal).
+- **Audit.** Every deletion writes an audit record naming the reason (`"auto-forget TTL"`, `"auto-forget contradiction"`, `"auto-forget low-value observation"`). We should do the same for anything destructive.
 - **Where.** `src/functions/auto-forget.ts`.
-- **Re-impl.** The concept-bucketing trick is the gem — it turns O(n²) into ~O(n × b) where b is avg bucket size. Don't skip it.
-- **Audit.** Every deletion writes an audit record naming the reason ("auto-forget TTL", "contradiction", "low-value"). We should do the same for anything destructive.
+- **Re-impl.** The concept-bucketing + `compared` Set is the gem — turns O(n²) into ~O(n × avg_bucket_size). Don't skip either half.
 
 ### B3. Crystallize: LLM-summarize a chain of actions into a digest + mint lessons  [M]
 - **Idea.** After a chain of completed actions, ask the LLM (single call, structured JSON output) to produce `{narrative, keyOutcomes, filesAffected, lessons}`. Then store the digest as a "crystal" and *also* fan-out the `lessons` array as separate persisted "lesson" records (each with confidence 0.6, sourced back to the crystal). The crystal's source actions get a back-pointer (`crystallizedInto`).
@@ -98,9 +108,24 @@ Each entry follows the same shape:
 - **Re-impl.** The pattern is "one LLM call yields N indexed sub-artifacts." Generic and useful for any post-task reflection step.
 
 ### B4. Frontier scoring: priority × 10 + age + dependency-graph status  [M]
-- **Idea.** "What should the agent do next?" — `frontier` walks all open actions, filters out anything with unfinished `requires` deps, unpassed `gated_by` checkpoints, or active `conflicts_with` peers, then scores: `priority × 10 + age_hours_decay + something_per_unblocked_dep`. Returns the top-K. The `next` endpoint is just `frontier(limit=1)`.
+- **Idea.** "What should the agent do next?" — `frontier` walks all open actions, filters out anything blocked, scores the rest, returns top-K. The `next` endpoint is just `frontier(limit=1)`.
+- **Blocker filter.** Drop any action where ANY of:
+  - An outbound `requires` edge points to an action whose status is not `done`.
+  - An outbound `gated_by` edge points to a checkpoint whose status is not `passed`.
+  - A `conflicts_with` edge (in either direction) involves another action currently `active`.
+  - An active, unexpired `lease` exists for this action under a different `agentId` (skip unless `includeLeasedByOthers`).
+- **Scoring formula** (computed only on unblocked actions):
+  ```
+  score = priority * 10
+        + min(ageHours * 0.5, 20)               // age decay, capped to prevent starvation
+        + unlockCount * 5                       // count of outbound "unlocks" edges from this action
+        + (has any outbound "spawned_by" edge ? 3 : 0)
+        + (action.status === "active"          ? 15 : 0)
+  ```
+  Round to 2 decimals before returning.
+- **Edge type vocabulary.** `requires | gated_by | conflicts_with | unlocks | spawned_by`. Encode as a string field on a flat `ActionEdge` row; in-memory `Map<actionId, Action>` for lookups.
 - **Where.** `src/functions/frontier.ts`.
-- **Re-impl.** Useful pattern: encode dependency types as named edges (`requires`, `gated_by`, `conflicts_with`). Don't reach for a real graph DB — `kv.list` + in-memory map is fine up to thousands of nodes.
+- **Re-impl.** Don't reach for a real graph DB — `kv.list` + in-memory map is fine up to thousands of nodes. The age cap (20) is the non-obvious knob; without it old low-priority actions slowly outscore fresh high-priority work.
 
 ### B5. Per-tool-call dedup with sliding TTL + sampled cleanup  [H]
 - **Idea.** `DedupMap` hashes `(sessionId, toolName, JSON.stringify(input).slice(0,500))` with SHA-256, stores `{hash, expiresAt}`, returns `isDuplicate(hash)`. TTL = 5 min, cleanup runs every 60s (interval is `unref`'d so it doesn't keep the process alive). The 500-char input cap prevents pathological inputs from blowing up dedup memory.
@@ -136,9 +161,23 @@ Each entry follows the same shape:
 - **Re-impl.** Both halves matter. Asymptotic reinforcement is the standard "Brownian confidence" trick; dual-condition delete is the smart part.
 
 ### B11. Skill extraction with fingerprinted dedup + frequency reinforcement  [M]
-- **Idea.** Mine reusable procedures (≥2 steps) from action history via LLM. Dedup against existing skills by `fingerprintId(normalize(title + trigger + steps))` — near-duplicates collapse. When a skill is observed again, `strength += 0.15` (capped at 1.0) rather than re-extracting via LLM. The fingerprint is the heart: it makes reinforcement cheap.
+- **Idea.** Mine reusable procedures from completed sessions via LLM. Soft-fail if the session is exploratory (LLM returns a sentinel like `<no-skill/>`) or has fewer than 2 steps after parsing.
+- **Fingerprint algorithm** (the heart of dedup):
+  ```
+  payload = JSON.stringify({
+    title:   title.toLowerCase(),
+    trigger: trigger.toLowerCase(),
+    steps:   steps.map(s => s.toLowerCase().trim())  // order-preserving
+  })
+  id = "skill_" + sha256(payload).slice(0, 16)        // 64-bit hex truncation
+  ```
+  Same title + same trigger + same step sequence (modulo case/whitespace) → same id → collision = dedup. Different step *order* → different id (intentional; order matters for procedures).
+- **Reinforcement on hit.** When a fingerprint already exists in the procedural store:
+  - If `sourceSessionIds` already contains the current `sessionId`, do nothing except bump `updatedAt` (don't reinforce on re-run of the same session).
+  - Otherwise: `strength = min(1.0, strength + 0.15)`, `frequency++`, append the new sessionId. No LLM call needed.
+- **Initial mint.** New skill stored with `strength = 0.6`, `frequency = 1`, source sessions/observations tracked (cap observation refs at 10).
 - **Where.** `src/functions/skill-extract.ts`.
-- **Re-impl.** Anywhere we mine "patterns" from history, this combo (LLM extract → fingerprint → frequency-based reinforce, no re-extract on dup) is the right shape.
+- **Re-impl.** Anywhere we mine "patterns" from history: LLM extract → structured fingerprint → frequency-based reinforce-without-re-extract is the right shape. The "same session can't reinforce twice" guard prevents repeated cron runs from inflating strength.
 
 ### B12. Reflect: BFS-on-concept-graph clustering with Jaccard fallback  [M]
 - **Idea.** To cluster related memories: primary strategy is BFS over the concept co-occurrence graph (depth ≤ 2, capped at 20 clusters). If the concept graph is sparse (newly bootstrapped system), fall back to Jaccard similarity (≥ 0.3 threshold) on term-doc sets. Top 50 insights returned.
@@ -165,10 +204,14 @@ Each entry follows the same shape:
 - **Where.** `src/functions/sentinels.ts`.
 - **Re-impl.** Useful as a *concept* for event-driven memory hooks but probably over-engineered for our scope.
 
-### B17. Temporal graph with 11 typed entity classes  [L]
-- **Idea.** LLM extracts entities into a fixed taxonomy: file, function, concept, error, decision, pattern, library, person, project, preference, location, organization, event. The fixed taxonomy is the trick — open-ended NER produces unstable downstream behavior; an 11-way enum yields reliable JSON.
+### B17. Temporal graph with closed-enum entity and relation types  [L]
+- **Idea.** LLM extracts entities + relationships into fixed taxonomies so downstream code can pattern-match safely. Open-ended NER yields drift; closed enums yield reliable JSON/XML.
+- **Entity types (13):** `file, function, concept, error, decision, pattern, library, person, project, preference, location, organization, event`.
+- **Relation types (16):** `uses, imports, modifies, causes, fixes, depends_on, related_to, works_at, prefers, blocked_by, caused_by, optimizes_for, rejected, avoids, located_in, succeeded_by`.
+- **Edge metadata.** Each edge carries: `weight ∈ [0.1, 1.0]` (1.0 = explicit, 0.5 = inferred, 0.1 = speculative), `valid_from` / `valid_to` ISO dates (or `"unknown"` / `"current"` sentinels), `reasoning`, `sentiment ∈ {positive, negative, neutral}`, optional list of `alternatives` that were considered.
+- **Versioning.** Never overwrite a relation — when a new edge would conflict with an existing `(source, target, type)` triple, mark the old one `isLatest=false`, set its `tvalidEnd`, link `supersededBy = newEdgeId`, and bump the new edge's `version`.
 - **Where.** `src/functions/temporal-graph.ts`.
-- **Re-impl.** When asking an LLM for structured extraction, **constrain the type space** to a closed enum. The exact 11 classes here are tuned for coding-agent memory; pick our own.
+- **Re-impl.** When asking an LLM for structured extraction, **constrain the type space** to a closed enum. The taxonomies here are tuned for coding-agent memory; pick your own — but pick a *finite* list.
 
 ---
 
@@ -180,9 +223,14 @@ Each entry follows the same shape:
 - **Re-impl.** ~10 LOC. Use this anywhere a string is compared against a secret. Plain `===` leaks length-of-prefix-match timing.
 
 ### C2. CSP nonce builder for the viewer / dashboard  [M]
-- **Idea.** A strict CSP whitelist generator: `default-src 'none'`, `script-src 'nonce-<base64url 16-byte>'`, `script-src-attr 'none'`, no `unsafe-inline`/`unsafe-eval` on scripts, allow `connect-src` to localhost-only. The placeholder string `__AGENTMEMORY_VIEWER_NONCE__` is templated into the HTML at request time.
-- **Where.** `src/auth.ts::buildViewerCsp`.
-- **Re-impl.** Anywhere we serve local HTML, mint a per-response nonce and lock CSP. Tightening default-src to `'none'` and explicitly allow-listing each directive is more secure than `'self'` with carve-outs.
+- **Idea.** Strict per-request CSP. Each response mints a fresh nonce, computes the `Content-Security-Policy` header that embeds it, and string-replaces a fixed placeholder in the static HTML template with the same nonce.
+- **Recipe:**
+  1. Define a single placeholder constant (e.g. `__APP_VIEWER_NONCE__`). Bake the same string into every `<script nonce="__APP_VIEWER_NONCE__">` attribute in the HTML template.
+  2. Per request: `nonce = randomBytes(16).toString("base64url")`.
+  3. Send: `html.replaceAll(placeholder, nonce)` as the body, with header `Content-Security-Policy: default-src 'none'; script-src 'nonce-${nonce}'; script-src-attr 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:*; ...`.
+  4. Never include `'unsafe-inline'` or `'unsafe-eval'` in `script-src`.
+- **Where.** `src/auth.ts::buildViewerCsp` + `VIEWER_NONCE_PLACEHOLDER` constant.
+- **Re-impl.** Anywhere we serve local HTML, mint a per-response nonce and lock CSP. Tightening `default-src` to `'none'` and explicitly allow-listing each directive is more secure than `'self'` with carve-outs.
 
 ### C3. Fail-open hooks: timeout, swallow errors, never block parent process  [H]
 - **Idea.** Hooks that call back into the memory service do:
